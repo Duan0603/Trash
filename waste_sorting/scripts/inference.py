@@ -33,7 +33,7 @@ SERVO_OTHER = 35
 
 IS_JETSON = os.path.exists('/etc/nv_tegra_release')
 HAS_DISPLAY = True
-if 'DISPLAY' not in os.environ: HAS_DISPLAY = False
+if IS_JETSON and 'DISPLAY' not in os.environ: HAS_DISPLAY = False
 
 # ================== BACKENDS ==================
 def try_load_pytorch():
@@ -59,7 +59,11 @@ def try_load_opencv():
         return None, None
 
     print(f"[INFO] Using OpenCV DNN (CPU optimized). Model: {onnx_path}")
-    net = cv2.dnn.readNetFromONNX(onnx_path)
+    try:
+        net = cv2.dnn.readNetFromONNX(onnx_path)
+    except AttributeError:
+        print("[ERROR] OpenCV DNN module missing! Run: pip3 install opencv-python")
+        return None, None
     net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
     net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
     return net, 'opencv'

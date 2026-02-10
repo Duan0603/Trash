@@ -1,50 +1,45 @@
 #!/bin/bash
-# Script to install Python 3.8 + PyTorch CUDA on Jetson Nano (JetPack 4.6)
+# Script to install PyTorch 1.10 (CUDA) on Jetson Nano (JetPack 4.6, Python 3.6 Default)
 
 echo "============================================="
-echo "  INSTALLING CUDA + PYTHON 3.8 FOR JETSON"
+echo "  INSTALLING CUDA + PYTORCH 1.10 (Recommended)"
 echo "============================================="
 
-# 1. Install Python 3.8
-echo "[1/6] Installing Python 3.8..."
+# 1. Install Dependencies
+echo "[1/5] Installing Dependencies..."
 sudo apt-get update
-sudo apt-get install -y python3.8 python3.8-dev python3.8-distutils libopenblas-base libopenmpi-dev
+sudo apt-get install -y python3-pip libopenblas-base libopenmpi-dev libjpeg-dev zlib1g-dev
 
-# 2. Install Pip for 3.8
-echo "[2/6] Installing pip for Python 3.8..."
-curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
-sudo python3.8 get-pip.py
-rm get-pip.py
+# 2. Upgrade pip (Important for newer wheels)
+echo "[2/5] Upgrading pip..."
+python3 -m pip install --upgrade pip
+python3 -m pip install "numpy<1.20"  # Older numpy for compatibility
 
-# 3. Install PyTorch 1.13 (CUDA enabled)
-echo "[3/6] Downloading PyTorch 1.13 (CUDA)..."
-# Link for JetPack 4.6 / Python 3.8
-wget https://developer.download.nvidia.com/compute/redist/jp/v461/pytorch/torch-1.13.0a0+git7c98f3a-cp38-cp38-linux_aarch64.whl -O torch_jetson.whl
-
+# 3. Download PyTorch 1.10.0 (Python 3.6)
+echo "[3/5] Downloading PyTorch 1.10 (CUDA)..."
+wget https://nvidia.box.com/shared/static/fjtbno0vpo676a25cgvuqc1wty0fkkg6.whl -O torch-1.10.0-cp36-cp36m-linux_aarch64.whl
 echo "Installing PyTorch..."
-python3.8 -m pip install torch_jetson.whl
-rm torch_jetson.whl
+python3 -m pip install torch-1.10.0-cp36-cp36m-linux_aarch64.whl
+rm torch-1.10.0-cp36-cp36m-linux_aarch64.whl
 
-# 4. Install TorchVision
-echo "[4/6] Installing TorchVision..."
-# TorchVision 0.14 corresponds to PyTorch 1.13
-python3.8 -m pip install torchvision==0.14.1
+# 4. Install TorchVision 0.11.1 (Matches PyTorch 1.10)
+echo "[4/5] Installing TorchVision..."
+# We need to compile or find wheel. Easiest is to install via git+https or find wheel.
+# NVIDIA recommends simple pip install if matching version found.
+# If fail, try:
+python3 -m pip install "torchvision==0.11.1"
 
-# 5. Install Ultralytics & OpenCV
-echo "[5/6] Installing YOLOv8 & libs..."
-python3.8 -m pip install ultralytics pandas psutil seaborn tqdm matplotlib
-# Use standard opencv-python (it works well on 3.8)
-python3.8 -m pip install opencv-python
+# 5. Install Ultralytics (Compatible Version)
+echo "[5/5] Installing YOLOv8 (Ultralytics)..."
+# Ultralytics dropped 3.6 support recently. Trying older stable.
+python3 -m pip install "ultralytics>=8.0.0" "pandas" "requests" "matplotlib" "seaborn" "tqdm" "psutil"
 
-# 6. Install Jetson GPIO
-echo "[6/6] Installing GPIO..."
-python3.8 -m pip install Jetson.GPIO
-sudo groupadd -f -r gpio
-sudo usermod -aG gpio $USER
+# Install Opencv (already on JetPack, but ensure python bindings)
+sudo apt-get install -y python3-opencv
 
 echo ""
 echo "============================================="
 echo "  CAI DAT THANH CONG!"
 echo "============================================="
-echo "De chay Code voi CUDA:"
-echo "  python3.8 inference.py"
+echo "De chay Code:"
+echo "  python3 inference.py"
