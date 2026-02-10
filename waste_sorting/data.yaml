@@ -1,0 +1,13 @@
+# YOLOv8 Dataset Config - Waste Sorting
+# Classes: plastic (bottles), metal (cans), other (glass)
+
+path: ../datasets
+train: images/train
+val: images/val
+
+names:
+  0: plastic
+  1: metal
+  2: other
+
+nc: 3
