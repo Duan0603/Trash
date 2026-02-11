@@ -56,17 +56,41 @@ def try_load_opencv():
     onnx_path = 'best.onnx' if os.path.exists('best.onnx') else '../models/waste_sorter/weights/best.onnx'
     if not os.path.exists(onnx_path):
         print(f"[ERROR] ONNX model not found: {onnx_path}")
-        return None, None
-
-    print(f"[INFO] Using OpenCV DNN (CPU optimized). Model: {onnx_path}")
     try:
         net = cv2.dnn.readNetFromONNX(onnx_path)
     except AttributeError:
-        print("[ERROR] OpenCV DNN module missing! Run: pip3 install opencv-python")
-        return None, None
+        # Fallback to onnxruntime if opencv-dnn fails/missing
+        return try_load_onnxruntime()
+    
     net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
     net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
     return net, 'opencv'
+
+def try_load_onnxruntime():
+    """Fallback: Load ONNX Runtime (GPU/CPU)"""
+    try:
+        import onnxruntime as ort
+        onnx_path = 'best.onnx' if os.path.exists('best.onnx') else '../models/waste_sorter/weights/best.onnx'
+        if not os.path.exists(onnx_path): return None, None
+        
+        providers = ort.get_available_providers()
+        print(f"[INFO] ONNX Runtime providers: {providers}")
+        
+        # Prioritize CUDA/TensorRT
+        if 'TensorrtExecutionProvider' in providers:
+            sess = ort.InferenceSession(onnx_path, providers=['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider'])
+            print("[INFO] Using ONNX Runtime (TensorRT/CUDA)")
+        elif 'CUDAExecutionProvider' in providers:
+            sess = ort.InferenceSession(onnx_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+            print("[INFO] Using ONNX Runtime (CUDA)")
+        else:
+            sess = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
+            print("[INFO] Using ONNX Runtime (CPU)")
+            
+        return sess, 'onnxruntime'
+    except ImportError:
+        print("[ERROR] Neither OpenCV DNN nor ONNX Runtime found.")
+        return None, None
 
 # ================== UTILS ==================
 def setup_gpio():
@@ -108,7 +132,11 @@ def main():
     # 1. Try PyTorch (CUDA)
     model, backend = try_load_pytorch()
     
-    # 2. If no CUDA, try OpenCV (CPU)
+    # 2. Try ONNX Runtime (GPU/CPU)
+    if not model:
+        model, backend = try_load_onnxruntime()
+        
+    # 3. Last resort: OpenCV DNN (CPU)
     if not model:
         model, backend = try_load_opencv()
     
@@ -162,26 +190,53 @@ def main():
                     cls = int(box.cls[0])
                     results.append((x1,y1,x2,y2,conf,cls))
             else:
-                # OpenCV Inference
+                # Backend is OpenCV OR OnnxRuntime
+                # Both need blob NCHW
                 blob = cv2.dnn.blobFromImage(roi, 1/255.0, (IMGSZ, IMGSZ), swapRB=True, crop=False)
-                model.setInput(blob)
-                outs = model.forward()
-                # Simplified postprocess for readability (assume single output)
+                
+                if backend == 'onnxruntime':
+                    # ONNX Runtime
+                    input_name = model.get_inputs()[0].name
+                    output_name = model.get_outputs()[0].name
+                    outs = model.run([output_name], {input_name: blob})[0]
+                else:
+                    # OpenCV DNN
+                    model.setInput(blob)
+                    outs = model.forward()
+                
+                # Shared Postprocess (YOLOv8 ONNX format)
                 outs = outs[0]
                 if outs.shape[0] < outs.shape[1]: outs = outs.T
+                
+                boxes = []
+                scores = []
+                class_ids = []
+                
                 h, w = roi.shape[:2]
                 rx, ry = w/IMGSZ, h/IMGSZ
+                
                 for det in outs:
-                    scores = det[4:]
-                    cls = np.argmax(scores)
-                    conf = scores[cls]
+                    cls_scores = det[4:]
+                    cls_id = np.argmax(cls_scores)
+                    conf = cls_scores[cls_id]
+                    
                     if conf > CONF_THRESHOLD:
                         cx, cy, bw, bh = det[:4]
                         x1 = int((cx - bw/2) * rx)
                         y1 = int((cy - bh/2) * ry)
-                        x2 = int((cx + bw/2) * rx)
-                        y2 = int((cy + bh/2) * ry)
-                        results.append((x1,y1,x2,y2,conf,cls))
+                        w_box = int(bw * rx)
+                        h_box = int(bh * ry)
+                        
+                        boxes.append([x1, y1, w_box, h_box])
+                        scores.append(float(conf))
+                        class_ids.append(cls_id)
+                
+                # NMS
+                indices = cv2.dnn.NMSBoxes(boxes, scores, CONF_THRESHOLD, 0.45)
+                if len(indices) > 0:
+                    for i in indices.flatten():
+                        x, y, w, h = boxes[i]
+                        results.append((x, y, x+w, y+h, scores[i], class_ids[i]))
 
             # Draw & Logic
             best_det = None
