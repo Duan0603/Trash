@@ -1,281 +1,205 @@
-"""
-Waste Sorting Inference - Hybrid Mode
-1. Checks for CUDA/PyTorch (Best performance on Jetson if installed)
-2. Fallback to OpenCV DNN (Good CPU performance)
-"""
+import cv2
+import torch
 import time
 import os
-import sys
 import collections
-import platform
+import threading
 import numpy as np
+import gc
+from flask import Flask, Response
+from ultralytics import YOLO
 
-# ================== CONFIG ==================
-# Classes
-CLASS_NAMES = ["plastic", "metal", "other"]
-CLASS_COLORS = [(0, 255, 0), (0, 165, 255), (128, 128, 128)]
+# --- SỬA LỖI HỆ THỐNG JETSON ---
+os.environ['OPENBLAS_CORETYPE'] = 'ARMV8'
+os.environ['LD_PRELOAD'] = '/usr/lib/aarch64-linux-gnu/libgomp.so.1'
 
-# ROI
-ROI_X1, ROI_Y1 = 150, 100
-ROI_X2, ROI_Y2 = 490, 380
+# ================== CẤU HÌNH TỐI ƯU ==================
+MODEL_PATH = '../models/waste_sorter/weights/best.engine' 
+if not os.path.exists(MODEL_PATH):
+    MODEL_PATH = '../models/waste_sorter/weights/best.pt'
 
-# Motion
-MOTION_THRESHOLD = 25
-MOTION_MIN_AREA = 3000
-BG_LEARN_FRAMES = 30
-IMGSZ = 480
-CONF_THRESHOLD = 0.25
+IMG_SIZE = 320          
+CONF_THRESHOLD = 0.50
+ROI_X1, ROI_Y1, ROI_X2, ROI_Y2 = 150, 100, 490, 380
 
-# GPIO
-SERVO_PLASTIC = 33
-SERVO_METAL = 32
-SERVO_OTHER = 35
+# GPIO Pins
+SERVO_PLASTIC_PIN = 33      
+SERVO_METAL_PIN = 32        
 
-IS_JETSON = os.path.exists('/etc/nv_tegra_release')
-HAS_DISPLAY = True
-if IS_JETSON and 'DISPLAY' not in os.environ: HAS_DISPLAY = False
+# Hệ thống đếm rác toàn cục
+counts = {'METAL': 0, 'PLASTIC': 0, 'other': 0}
+COLOR_MAP = {'METAL': (0, 255, 0), 'PLASTIC': (0, 0, 255), 'other': (128, 128, 128)}
 
-# ================== BACKENDS ==================
-def try_load_pytorch():
-    """Try loading Ultralytics YOLO (PyTorch backend)"""
-    try:
-        import torch
-        if torch.cuda.is_available():
-            print("[INFO] PyTorch CUDA detected! Using GPU.")
-            from ultralytics import YOLO
-            model = YOLO('../models/waste_sorter/weights/best.pt')
-            model.to('cuda')
-            return model, 'pytorch'
-    except ImportError:
-        pass
-    return None, None
+FRAME_SKIP = 2 
+REQUIRED_FRAMES = 3  
 
-def try_load_opencv():
-    """Fallback: Load OpenCV DNN (ONNX backend)"""
-    import cv2
-    onnx_path = 'best.onnx' if os.path.exists('best.onnx') else '../models/waste_sorter/weights/best.onnx'
-    if not os.path.exists(onnx_path):
-        print(f"[ERROR] ONNX model not found: {onnx_path}")
-    try:
-        net = cv2.dnn.readNetFromONNX(onnx_path)
-    except AttributeError:
-        # Fallback to onnxruntime if opencv-dnn fails/missing
-        return try_load_onnxruntime()
-    
-    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
-    return net, 'opencv'
+outputFrame = None
+lock = threading.Lock()
+app = Flask(__name__)
 
-def try_load_onnxruntime():
-    """Fallback: Load ONNX Runtime (GPU/CPU)"""
-    try:
-        import onnxruntime as ort
-        onnx_path = 'best.onnx' if os.path.exists('best.onnx') else '../models/waste_sorter/weights/best.onnx'
-        if not os.path.exists(onnx_path): return None, None
-        
-        providers = ort.get_available_providers()
-        print(f"[INFO] ONNX Runtime providers: {providers}")
-        
-        # Prioritize CUDA/TensorRT
-        if 'TensorrtExecutionProvider' in providers:
-            sess = ort.InferenceSession(onnx_path, providers=['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider'])
-            print("[INFO] Using ONNX Runtime (TensorRT/CUDA)")
-        elif 'CUDAExecutionProvider' in providers:
-            sess = ort.InferenceSession(onnx_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-            print("[INFO] Using ONNX Runtime (CUDA)")
-        else:
-            sess = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
-            print("[INFO] Using ONNX Runtime (CPU)")
-            
-        return sess, 'onnxruntime'
-    except ImportError:
-        print("[ERROR] Neither OpenCV DNN nor ONNX Runtime found.")
-        return None, None
+# ================== HÀM HỖ TRỢ PHẦN CỨNG ==================
+pwm_plastic = None
+pwm_metal = None
+GPIO_AVAILABLE = False
 
-# ================== UTILS ==================
-def setup_gpio():
-    if not IS_JETSON: return None
+def init_gpio():
+    global pwm_plastic, pwm_metal, GPIO_AVAILABLE
     try:
         import Jetson.GPIO as GPIO
-        GPIO.setmode(GPIO.BOARD)
         GPIO.setwarnings(False)
-        for p in [SERVO_PLASTIC, SERVO_METAL, SERVO_OTHER]:
-            GPIO.setup(p, GPIO.OUT)
-            GPIO.output(p, GPIO.LOW)
-        return GPIO
-    except: return None
-
-def trigger(cls, gpio):
-    if not gpio: return
-    pins = {"plastic": SERVO_PLASTIC, "metal": SERVO_METAL, "other": SERVO_OTHER}
-    if cls in pins:
-        try:
-            gpio.output(pins[cls], gpio.HIGH)
-            time.sleep(0.3)
-            gpio.output(pins[cls], gpio.LOW)
-        except: pass
-
-def open_camera():
-    import cv2
-    if IS_JETSON:
-        gst = f"nvarguscamerasrc ! video/x-raw(memory:NVMM), width=640, height=480, format=NV12, framerate=30/1 ! nvvidconv flip-method=0 ! video/x-raw, width=640, height=480, format=BGR ! appsink drop=1"
-        cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
-        if cap.isOpened(): return cap
-        return cv2.VideoCapture(0, cv2.CAP_V4L2)
-    return cv2.VideoCapture(0)
-
-# ================== MAIN ==================
-def main():
-    import cv2
-    print("="*40)
-    
-    # 1. Try PyTorch (CUDA)
-    model, backend = try_load_pytorch()
-    
-    # 2. Try ONNX Runtime (GPU/CPU)
-    if not model:
-        model, backend = try_load_onnxruntime()
+        GPIO.setmode(GPIO.BOARD)
+        GPIO.setup([SERVO_PLASTIC_PIN, SERVO_METAL_PIN], GPIO.OUT)
         
-    # 3. Last resort: OpenCV DNN (CPU)
-    if not model:
-        model, backend = try_load_opencv()
+        pwm_plastic = GPIO.PWM(SERVO_PLASTIC_PIN, 50)
+        pwm_metal = GPIO.PWM(SERVO_METAL_PIN, 50)
+        pwm_plastic.start(0)
+        pwm_metal.start(0)
+        GPIO_AVAILABLE = True
+        print("[INFO] GPIO Initialized Successfully.")
+        return GPIO
+    except Exception as e:
+        print(f"[ERR] GPIO Init Failed: {e}. Chạy chế độ không có phần cứng.")
+        return None
+
+def set_servo_angle(pwm, angle):
+    if pwm:
+        duty = angle / 18.0 + 2.0
+        pwm.ChangeDutyCycle(duty)
+        time.sleep(0.4)
+        pwm.ChangeDutyCycle(0) 
+
+def trigger_servo_logic(cls):
+    global counts
+    if cls == "PLASTIC" and pwm_plastic:
+        print("--> ĐANG GẠT PLASTIC")
+        counts['PLASTIC'] += 1
+        set_servo_angle(pwm_plastic, 45)
+        time.sleep(0.8)
+        set_servo_angle(pwm_plastic, 90)
+    elif cls == "METAL" and pwm_metal:
+        print("--> ĐANG GẠT METAL")
+        counts['METAL'] += 1
+        set_servo_angle(pwm_metal, 135)
+        time.sleep(0.8)
+        set_servo_angle(pwm_metal, 90)
+    elif cls == "other":
+        counts['other'] += 1
+
+# ================== UI & DASHBOARD ==================
+
+def draw_dashboard(img):
+    overlay = img.copy()
+    cv2.rectangle(overlay, (5, 5), (230, 140), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
     
-    if not model:
-        print("[ERROR] No valid model loaded!")
+    cv2.putText(img, "WASTE TRACKER", (15, 30), cv2.FONT_HERSHEY_DUPLEX, 0.7, (255, 255, 255), 2)
+    cv2.line(img, (15, 40), (210, 40), (255, 255, 255), 1)
+    
+    cv2.putText(img, f"METAL:   {counts['METAL']}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_MAP['METAL'], 2)
+    cv2.putText(img, f"PLASTIC: {counts['PLASTIC']}", (20, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_MAP['PLASTIC'], 2)
+    cv2.putText(img, f"OTHER:   {counts['other']}", (20, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_MAP['other'], 2)
+
+@app.route("/video_feed")
+def video_feed():
+    def generate():
+        global outputFrame, lock
+        while True:
+            with lock:
+                if outputFrame is None: continue
+                _, encodedImage = cv2.imencode(".jpg", outputFrame, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+            yield(b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + bytearray(encodedImage) + b'\r\n')
+    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+# ================== MAIN PROCESS ==================
+
+def main():
+    global outputFrame, lock
+    GPIO_LIB = init_gpio()
+    
+    # Chạy Web Server (Truy cập qua IP_JETSON:5000/video_feed)
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=5000, threaded=True, use_reloader=False), daemon=True).start()
+
+    print(f"[INFO] Nạp Model: {MODEL_PATH}")
+    model = YOLO(MODEL_PATH, task='detect')
+    
+    def get_video_capture():
+        # Thử CSI GStreamer
+        gst = ("nvarguscamerasrc ! video/x-raw(memory:NVMM), width=640, height=480, format=NV12, framerate=30/1 ! "
+               "nvvidconv flip-method=0 ! video/x-raw, format=BGR ! appsink drop=True")
+        c = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+        if c.isOpened(): return c
+        
+        # Thử USB video0 -> video1
+        for i in [0, 1, 2]:
+            c = cv2.VideoCapture(i)
+            if c.isOpened(): return c
+        return None
+
+    cap = get_video_capture()
+    if cap is None or not cap.isOpened():
+        print("[ERR] Không thể mở bất kỳ Camera nào.")
         return
 
-    print(f"[INFO] Backend active: {backend.upper()}")
-    
-    gpio = setup_gpio()
-    cap = open_camera()
-    if not cap.isOpened(): return
+    frame_count = 0
+    last_act_time = 0
+    history = collections.deque(maxlen=10)
 
-    # Background learn
-    print("[INFO] Learning background...")
-    bg_acc = None
-    for _ in range(BG_LEARN_FRAMES):
-        ret, frame = cap.read()
-        if ret:
-            roi = frame[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2]
-            gray = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (21, 21), 0)
-            if bg_acc is None: bg_acc = gray.astype(float)
-            else: cv2.accumulateWeighted(gray, bg_acc, 0.5)
-    
-    bg_gray = cv2.convertScaleAbs(bg_acc)
-    print("[INFO] Ready!")
-    
-    history = collections.deque(maxlen=5)
-    last_act = 0
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret: break
+            frame_count += 1
+            
+            draw_dashboard(frame)
+            cv2.rectangle(frame, (ROI_X1, ROI_Y1), (ROI_X2, ROI_Y2), (255, 0, 0), 2)
 
-    while True:
-        ret, frame = cap.read()
-        if not ret: break
-        
-        t0 = time.time()
-        roi = frame[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2]
-        gray = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (21, 21), 0)
-        
-        # Motion
-        diff = cv2.absdiff(gray, bg_gray)
-        _, thresh = cv2.threshold(diff, MOTION_THRESHOLD, 255, cv2.THRESH_BINARY)
-        if cv2.countNonZero(thresh) > MOTION_MIN_AREA:
-            # Run Inference
-            results = []
-            if backend == 'pytorch':
-                # PyTorch Inference
-                res = model.predict(roi, imgsz=IMGSZ, conf=CONF_THRESHOLD, verbose=False)[0]
-                for box in res.boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    conf = float(box.conf[0])
-                    cls = int(box.cls[0])
-                    results.append((x1,y1,x2,y2,conf,cls))
-            else:
-                # Backend is OpenCV OR OnnxRuntime
-                # Both need blob NCHW
-                blob = cv2.dnn.blobFromImage(roi, 1/255.0, (IMGSZ, IMGSZ), swapRB=True, crop=False)
-                
-                if backend == 'onnxruntime':
-                    # ONNX Runtime
-                    input_name = model.get_inputs()[0].name
-                    output_name = model.get_outputs()[0].name
-                    outs = model.run([output_name], {input_name: blob})[0]
+            if frame_count % FRAME_SKIP == 0:
+                roi_frame = frame[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2]
+                results = model.predict(source=roi_frame, conf=CONF_THRESHOLD, imgsz=IMG_SIZE, half=True, verbose=False)[0]
+
+                best_det = None
+                max_area = 0
+                for box in results.boxes:
+                    bx1, by1, bx2, by2 = map(int, box.xyxy[0])
+                    area = (bx2 - bx1) * (by2 - by1)
+                    if area > 1000 and area > max_area:
+                        max_area = area
+                        best_det = {'box': (bx1+ROI_X1, by1+ROI_Y1, bx2+ROI_X1, by2+ROI_Y1), 
+                                    'label': model.names[int(box.cls[0])].upper()}
+
+                if best_det:
+                    history.append(best_det['label'])
+                    cv2.rectangle(frame, (best_det['box'][0], best_det['box'][1]), 
+                                 (best_det['box'][2], best_det['box'][3]), COLOR_MAP.get(best_det['label'], (255,255,255)), 2)
                 else:
-                    # OpenCV DNN
-                    model.setInput(blob)
-                    outs = model.forward()
-                
-                # Shared Postprocess (YOLOv8 ONNX format)
-                outs = outs[0]
-                if outs.shape[0] < outs.shape[1]: outs = outs.T
-                
-                boxes = []
-                scores = []
-                class_ids = []
-                
-                h, w = roi.shape[:2]
-                rx, ry = w/IMGSZ, h/IMGSZ
-                
-                for det in outs:
-                    cls_scores = det[4:]
-                    cls_id = np.argmax(cls_scores)
-                    conf = cls_scores[cls_id]
-                    
-                    if conf > CONF_THRESHOLD:
-                        cx, cy, bw, bh = det[:4]
-                        x1 = int((cx - bw/2) * rx)
-                        y1 = int((cy - bh/2) * ry)
-                        w_box = int(bw * rx)
-                        h_box = int(bh * ry)
-                        
-                        boxes.append([x1, y1, w_box, h_box])
-                        scores.append(float(conf))
-                        class_ids.append(cls_id)
-                
-                # NMS
-                indices = cv2.dnn.NMSBoxes(boxes, scores, CONF_THRESHOLD, 0.45)
-                if len(indices) > 0:
-                    for i in indices.flatten():
-                        x, y, w, h = boxes[i]
-                        results.append((x, y, x+w, y+h, scores[i], class_ids[i]))
+                    history.append(None)
 
-            # Draw & Logic
-            best_det = None
-            max_conf = 0
-            
-            for (x1,y1,x2,y2,conf,cls) in results:
-                gx1, gy1 = x1+ROI_X1, y1+ROI_Y1
-                gx2, gy2 = x2+ROI_X1, y2+ROI_Y1
-                color = CLASS_COLORS[cls]
-                cv2.rectangle(frame, (gx1,gy1), (gx2,gy2), color, 2)
-                if conf > max_conf:
-                    max_conf = conf
-                    best_det = CLASS_NAMES[cls]
-            
-            history.append(best_det)
-        else:
-            history.append(None)
-            cv2.rectangle(frame, (ROI_X1, ROI_Y1), (ROI_X2, ROI_Y2), (0,255,255), 2)
+            valid_hits = [h for h in history if h and h in ['METAL', 'PLASTIC']]
+            if len(valid_hits) >= REQUIRED_FRAMES:
+                stable_cls = collections.Counter(valid_hits).most_common(1)[0][0]
+                if (time.time() - last_act_time) > 2.5: 
+                    threading.Thread(target=trigger_servo_logic, args=(stable_cls,)).start()
+                    last_act_time = time.time()
+                    history.clear()
 
-        # Actuator
-        if len(history) == 5:
-            c = collections.Counter([h for h in history if h])
-            if c:
-                top = c.most_common(1)[0]
-                if top[1] >= 2 and (time.time() - last_act) > 1.0:
-                    trigger(top[0], gpio)
-                    last_act = time.time()
-                    cv2.putText(frame, f"SORT: {top[0].upper()}", (20, 400), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 1, (0,255,0), 2)
+            with lock:
+                outputFrame = frame.copy()
 
-        if HAS_DISPLAY:
-            cv2.imshow("Waste Sorting", frame)
-            if cv2.waitKey(1) == ord('q'): break
-            
-    cap.release()
-    if HAS_DISPLAY: cv2.destroyAllWindows()
-    if gpio: 
-        try: gpio.cleanup()
-        except: pass
+            if frame_count % 100 == 0:
+                torch.cuda.empty_cache()
+                gc.collect()
+
+    except KeyboardInterrupt:
+        print("[INFO] Đang dừng chương trình...")
+
+    finally:
+        # Giải phóng tài nguyên
+        if pwm_plastic: pwm_plastic.stop()
+        if pwm_metal: pwm_metal.stop()
+        if GPIO_LIB: GPIO_LIB.cleanup()
+        if cap: cap.release()
+        # Đã xóa cv2.destroyAllWindows() để tránh lỗi trên Jetson headless
+        print("[INFO] Đã dọn dẹp xong.")
 
 if __name__ == "__main__":
     main()
