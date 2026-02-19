@@ -1,0 +1,18 @@
+- cd /home/conghung/Documents/Trash/waste_sorting
+- ./setup_swap.sh
+
+- sudo systemctl restart docker
+
+- sudo docker run -it --rm --runtime nvidia --network host \
+  --privileged \
+  --device /dev/video0:/dev/video0 \
+  --device /dev/gpiomem:/dev/gpiomem \
+  -v ~/Documents/Trash/waste_sorting:/workspace \
+  ultralytics/ultralytics:latest-jetson-jetpack4
+
+- python3 -m pip install --upgrade pip
+- python3 -m pip install "setuptools<70.0.0"
+- python3 -m pip install flask Jetson.GPIO numpy==1.23.5
+
+- cd ../workspace/scripts
+- python3 inference.py
